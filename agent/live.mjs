@@ -20,6 +20,11 @@ if (!OPENAI_KEY) {
   process.exit(2);
 }
 
+const PROVIDER = (process.env.BING_NEWS_KEY ? "bing" :
+                 (process.env.GNEWS_API_KEY ? "gnews" : "none"));
+if (PROVIDER === "none") throw new Error("Set BING_NEWS_KEY or GNEWS_API_KEY");
+
+
 // ---------- Helpers ----------
 function todayIST() {
   const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -37,59 +42,73 @@ function pickBetterStatus(a, b) {
 }
 
 // ---------- Fetch news from either provider ----------
-async function fetchBingNews(query) {
-  const url = new URL("https://api.bing.microsoft.com/v7.0/news/search");
-  url.searchParams.set("q", query);
-  url.searchParams.set("mkt", "en-IN");
-  url.searchParams.set("count", String(Math.min(MAX_ARTICLES, 50)));
-  url.searchParams.set("freshness", "Month");
-  url.searchParams.set("sortBy", "Date");
-  const r = await fetch(url, { headers: { "Ocp-Apim-Subscription-Key": BING_KEY } });
-  if (!r.ok) throw new Error(`Bing news error ${r.status}`);
-  const j = await r.json();
-  return (j.value || []).map(v => ({
-    title: v.name, description: v.description, url: v.url,
-    source: v.provider?.[0]?.name, publishedAt: v.datePublished
-  }));
-}
 
-async function fetchGNews(query) {
+async function fetchGNewsSimple(query, page = 1, perPage = 10) {
   const url = new URL("https://gnews.io/api/v4/search");
-  url.searchParams.set("q", query);
+  url.searchParams.set("q", query);          // keep it simple, no site:/OR
   url.searchParams.set("lang", LANG);
   url.searchParams.set("country", COUNTRY);
-  url.searchParams.set("max", String(Math.min(MAX_ARTICLES, 50)));
+  url.searchParams.set("max", String(perPage));  // free tier: <= 10
+  url.searchParams.set("page", String(page));    // pagination
   url.searchParams.set("token", GNEWS_KEY);
+
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`GNews error ${r.status}`);
-  const j = await r.json();
+  const text = await r.text();
+  if (!r.ok) throw new Error(`GNews ${r.status}: ${text}`);
+  const j = JSON.parse(text);
+
   return (j.articles || []).map(a => ({
-    title: a.title, description: a.description, url: a.url,
-    source: a.source?.name, publishedAt: a.publishedAt
+    title: a.title,
+    description: a.description,
+    url: a.url,
+    source: a.source?.name,
+    publishedAt: a.publishedAt
   }));
 }
 
+
+
 async function getArticles() {
-  // IPO-focused queries
-  const queries = [
-    'IPO India DRHP OR RHP',
-    'site:sebi.gov.in DRHP',
-    'site:nseindia.com RHP OR "Public Issue"',
-    'site:bseindia.com "Public Issue" OR "RHP"'
+  const queriesBing = [
+    'IPO India DRHP RHP',
+    'SEBI DRHP',
+    'NSE India RHP "Public Issue"',
+    'BSE "Public Issue" RHP'
   ];
+
+  const queriesGNews = [
+    'India IPO DRHP',
+    'India IPO RHP',
+    'SEBI IPO filing',
+    'NSE corporate announcement IPO',
+    'BSE corporate announcement IPO'
+  ];
+
   let all = [];
-  for (const q of queries) {
-    let chunk = [];
-    if (BING_KEY) chunk = await fetchBingNews(q);
-    else if (GNEWS_KEY) chunk = await fetchGNews(q);
-    else throw new Error("Set BING_NEWS_KEY or GNEWS_API_KEY");
-    all = all.concat(chunk);
-    await new Promise(r => setTimeout(r, 200)); // be polite
+
+  if (PROVIDER === "bing") {
+    for (const q of queriesBing) {
+      const chunk = await fetchBingNews(q);
+      all = all.concat(chunk);
+      await new Promise(r => setTimeout(r, 200));
+    }
+  } else { // gnews
+    const perPage = Math.min(10, MAX_ARTICLES);  // free tier limit
+    const pages = Math.max(1, Math.ceil(MAX_ARTICLES / perPage));
+    for (const q of queriesGNews) {
+      for (let p = 1; p <= pages; p++) {
+        const chunk = await fetchGNewsSimple(q, p, perPage);
+        all = all.concat(chunk);
+        await new Promise(r => setTimeout(r, 150));
+      }
+    }
   }
-  // Dedupe by URL
+
+  // dedupe by URL
   const seen = new Set();
   return all.filter(a => !seen.has(a.url) && seen.add(a.url));
 }
+
 
 // ---------- AI extraction per article ----------
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
