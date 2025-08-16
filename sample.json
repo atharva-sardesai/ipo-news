@@ -1,0 +1,21 @@
+{
+  "as_of_date": "2025-09-01",
+  "timezone": "Asia/Kolkata",
+  "source_notes": ["SEBI", "NSE/BSE", "Media"],
+  "changes_since_last_run": "Sample run",
+  "items": [
+    {
+      "company": "Acme Industries Ltd",
+      "sector": "Manufacturing",
+      "issue_size_cr": 1200,
+      "status": "RHP",
+      "expected_window": "Sep–Oct 2025",
+      "lead_banks": ["Kotak Mahindra", "ICICI Securities"],
+      "links": {
+        "drhp": "https://example.com/drhp",
+        "exchange_notice": "https://example.com/notice"
+      },
+      "notes": "Testing row"
+    }
+  ]
+}
