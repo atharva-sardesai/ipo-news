@@ -12,10 +12,12 @@
       "expected_window": "Sep–Oct 2025",
       "lead_banks": ["Kotak Mahindra", "ICICI Securities"],
       "links": {
-        "drhp": "https://example.com/drhp",
-        "exchange_notice": "https://example.com/notice"
+        "drhp": "",
+        "rhp": "",
+        "exchange_notice": "",
+        "news": ""
       },
-      "notes": "Testing row"
+      "notes": "Demo row — replace with real data"
     }
   ]
 }
