@@ -108,10 +108,9 @@ app.use((req, res, next) => {
 app.post("/monthly", async (req, res) => {
   const parsed = Payload.safeParse(req.body);
   if (!parsed.success) {
+    console.error("Zod error:", JSON.stringify(parsed.error.flatten(), null, 2));
     return res.status(400).json({ error: parsed.error.flatten() });
   }
-  const payload = parsed.data;
-  const html = buildHtml(payload);
 
 if (!(process.env.SENDGRID_API_KEY && process.env.FROM_EMAIL && process.env.TO_EMAIL)) {
   return res.status(500).json({ error: "SendGrid not configured" });
