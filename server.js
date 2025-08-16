@@ -106,21 +106,44 @@ app.use((req, res, next) => {
 
 // -------- Endpoint --------
 app.post("/monthly", async (req, res) => {
+  // 1) Validate
   const parsed = Payload.safeParse(req.body);
   if (!parsed.success) {
     console.error("Zod error:", JSON.stringify(parsed.error.flatten(), null, 2));
     return res.status(400).json({ error: parsed.error.flatten() });
   }
 
-if (!(process.env.SENDGRID_API_KEY && process.env.FROM_EMAIL && process.env.TO_EMAIL)) {
-  return res.status(500).json({ error: "SendGrid not configured" });
-}
-await sgMail.send({
-  to: parseRecipients(process.env.TO_EMAIL),
-  from: process.env.FROM_EMAIL,
-  subject: `Upcoming India IPOs — ${payload.as_of_date}`,
-  html
-});
+  // 2) Make 'payload' available to the whole handler (not inside a narrower block)
+  const payload = parsed.data;
+  const html = buildHtml(payload);
+
+  try {
+    // 3) SendGrid (preferred)
+    if (process.env.SENDGRID_API_KEY && process.env.FROM_EMAIL && process.env.TO_EMAIL) {
+      await sgMail.send({
+        to: process.env.TO_EMAIL.split(",").map(s => s.trim()).filter(Boolean),
+        from: process.env.FROM_EMAIL, // must be verified in SendGrid
+        subject: `Upcoming India IPOs — ${payload.as_of_date}`,
+        html
+      });
+    }
+
+    // 4) (Optional) forward JSON to Zapier
+    if (process.env.ZAPIER_HOOK_URL) {
+      await fetch(process.env.ZAPIER_HOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    }
+
+    // 5) Done
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delivery error:", err?.response?.body || err.message || err);
+    // You can still return 200 if you don't want callers to retry:
+    return res.status(500).json({ error: "delivery_failed" });
+  }
 });
 
 // -------- Health check --------
