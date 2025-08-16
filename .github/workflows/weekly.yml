@@ -2,7 +2,7 @@ name: IPO weekly agent
 
 on:
   schedule:
-    # 09:00 IST = 03:30 UTC on MONday
+    # 09:00 IST = 03:30 UTC every Monday
     - cron: "30 3 * * MON"
   workflow_dispatch: {}
 
@@ -12,8 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node 20
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
@@ -21,18 +20,27 @@ jobs:
         working-directory: agent
         run: npm ci || npm i
 
+      - name: Debug provider selection (no secrets printed)
+        env:
+          BING_NEWS_KEY: ${{ secrets.BING_NEWS_KEY }}
+          GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
+        run: |
+          if [ -n "$BING_NEWS_KEY" ]; then echo "provider=bing";
+          elif [ -n "$GNEWS_API_KEY" ]; then echo "provider=gnews";
+          else echo "provider=none"; fi
+
       - name: Run live agent
         working-directory: agent
         env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}     # e.g., https://ipo-news.onrender.com/monthly
+          WEBHOOK_URL:   ${{ secrets.WEBHOOK_URL }}
           SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: gpt-4o-mini
 
-          # choose ONE:
-          BING_NEWS_KEY: ${{ secrets.BING_NEWS_KEY }}
-          # GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
+          # Use GNews (leave Bing unset)
+          GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
 
+          # Optional tuning
           MAX_ARTICLES: "30"
           COUNTRY: "in"
           LANG: "en"
