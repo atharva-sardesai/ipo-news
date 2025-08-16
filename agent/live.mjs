@@ -3,7 +3,6 @@ import OpenAI from "openai";
 // ---------- ENV ----------
 const WEBHOOK_URL   = process.env.WEBHOOK_URL;           // e.g., https://.../monthly
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
-const BING_KEY      = process.env.BING_NEWS_KEY || "";
 const GNEWS_KEY     = process.env.GNEWS_API_KEY || "";
 const OPENAI_KEY    = process.env.OPENAI_API_KEY || "";
 const AI_MODEL      = process.env.AI_MODEL || "gpt-4o-mini";
