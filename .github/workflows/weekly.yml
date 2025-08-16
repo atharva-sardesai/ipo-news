@@ -22,6 +22,7 @@ jobs:
 
       - name: Debug provider selection (no secrets printed)
         env:
+          BING_NEWS_KEY: ${{ secrets.BING_NEWS_KEY }}
           GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
         run: |
           if [ -n "$BING_NEWS_KEY" ]; then echo "provider=bing";
