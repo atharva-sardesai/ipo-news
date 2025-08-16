@@ -11,6 +11,21 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan(':method :url :status :res[content-length] - :response-time ms'));
 
+
+function getRecipients() {
+  return (process.env.TO_EMAIL || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+function requireSecret(req, res, next) {
+  const required = process.env.SHARED_SECRET;
+  if (!required) return next();
+  const token = req.get("X-Auth-Token") || req.get("x-auth-token");
+  if (token !== required) return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
+
 /* ---------- Validation (more forgiving) ---------- */
 const Item = z.object({
   company: z.string(),
@@ -112,38 +127,38 @@ app.get("/status", requireSecret, (_req, res) => {
 
 /* ---------- Email providers ---------- */
 // Choose ONE provider path; here I show Resend (simple). If using SendGrid instead, see commented block below.
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+// const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-async function sendEmail(subject, html) {
-  const to = getRecipients();
-  if (!to.length) throw new Error("NO_RECIPIENTS");
-  if (process.env.DRY_RUN === "1") {
-    console.log("[dry-run] would send to:", to.join(", "));
-    return;
-  }
+// async function sendEmail(subject, html) {
+//   const to = getRecipients();
+//   if (!to.length) throw new Error("NO_RECIPIENTS");
+//   if (process.env.DRY_RUN === "1") {
+//     console.log("[dry-run] would send to:", to.join(", "));
+//     return;
+//   }
 
-  if (resend && process.env.FROM_EMAIL) {
-    const resp = await resend.emails.send({
-      from: process.env.FROM_EMAIL, // must be verified sender/domain in Resend
-      to,
-      subject,
-      html
-    });
-    console.log("[resend] queued:", JSON.stringify(resp));
-    return;
-  }
+//   if (resend && process.env.FROM_EMAIL) {
+//     const resp = await resend.emails.send({
+//       from: process.env.FROM_EMAIL, // must be verified sender/domain in Resend
+//       to,
+//       subject,
+//       html
+//     });
+//     console.log("[resend] queued:", JSON.stringify(resp));
+//     return;
+//   }
 
   // --- SendGrid alternative ---
-  // import sgMail from "@sendgrid/mail" at top and set key:
-  // if (process.env.SENDGRID_API_KEY) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-  // if (process.env.SENDGRID_API_KEY && process.env.FROM_EMAIL) {
-  //   await sgMail.send({ to, from: process.env.FROM_EMAIL, subject, html });
-  //   console.log("[sendgrid] queued to:", to.join(", "));
-  //   return;
-  // }
+import sgMail from "@sendgrid/mail" 
+if (process.env.SENDGRID_API_KEY) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+if (process.env.SENDGRID_API_KEY && process.env.FROM_EMAIL) {
+    await sgMail.send({ to, from: process.env.FROM_EMAIL, subject, html });
+    console.log("[sendgrid] queued to:", to.join(", "));
+    return;
+  }
 
-  throw new Error("NO_DELIVERY_PATH_CONFIGURED");
-}
+throw new Error("NO_DELIVERY_PATH_CONFIGURED");
+
 
 /* ---------- Main endpoint (protected) ---------- */
 app.post("/monthly", requireSecret, async (req, res) => {
@@ -162,7 +177,22 @@ app.post("/monthly", requireSecret, async (req, res) => {
   });
 
   try {
-    await sendEmail(`Upcoming India IPOs — ${payload.as_of_date}`, html);
+    if (process.env.DRY_RUN === "1") {
+      console.log("[dry-run] would send to:", getRecipients().join(", "));
+    } else {
+      const to = getRecipients();
+      if (!process.env.SENDGRID_API_KEY) throw new Error("SENDGRID_KEY_MISSING");
+      if (!process.env.FROM_EMAIL) throw new Error("FROM_EMAIL_MISSING");
+      if (!to.length) throw new Error("NO_RECIPIENTS");
+
+      await sgMail.send({
+        to,
+        from: process.env.FROM_EMAIL, // must be a verified sender in SendGrid
+        subject: `Upcoming India IPOs — ${payload.as_of_date}`,
+        html
+      });
+      console.log("[sendgrid] queued to:", to.join(", "));
+    }
 
     if (process.env.ZAPIER_HOOK_URL) {
       const r = await fetch(process.env.ZAPIER_HOOK_URL, {
@@ -175,14 +205,14 @@ app.post("/monthly", requireSecret, async (req, res) => {
 
     return res.json({ ok: true });
   } catch (err) {
+    const sgBody = err?.response?.body ? JSON.stringify(err.response.body) : null;
     console.error("Delivery error:", {
       name: err?.name,
       message: err?.message,
-      stack: err?.stack
+      stack: err?.stack,
+      sgBody
     });
-    // Return a clear error so you know config is missing
-    const code = err?.message === "NO_DELIVERY_PATH_CONFIGURED" ? 500 : 500;
-    return res.status(code).json({ error: err?.message || "delivery_failed" });
+    return res.status(500).json({ error: err?.message || "delivery_failed" });
   }
 });
 
