@@ -1,0 +1,39 @@
+name: IPO weekly agent
+
+on:
+  schedule:
+    # 09:00 IST = 03:30 UTC on MONday
+    - cron: "30 3 * * MON"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: agent
+        run: npm ci || npm i
+
+      - name: Run live agent
+        working-directory: agent
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}     # e.g., https://ipo-news.onrender.com/monthly
+          SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AI_MODEL: gpt-4o-mini
+
+          # choose ONE:
+          BING_NEWS_KEY: ${{ secrets.BING_NEWS_KEY }}
+          # GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
+
+          MAX_ARTICLES: "30"
+          COUNTRY: "in"
+          LANG: "en"
+        run: npm start
