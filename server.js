@@ -1,45 +1,29 @@
+// server.js
 import express from "express";
 import dotenv from "dotenv";
-import morgan from "morgan";
 import { z } from "zod";
-import { Resend } from "resend"; // OR use @sendgrid/mail if you prefer
-// If you want SendGrid instead, comment Resend lines and use sgMail (shown below in comments)
+import sgMail from "@sendgrid/mail";
+import morgan from "morgan"; // if you didn't install: remove this line + the app.use(morgan...) line
 
 dotenv.config();
+sgMail.setApiKey(process.env.SENDGRID_API_KEY || "");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan(':method :url :status :res[content-length] - :response-time ms'));
 
-
-function getRecipients() {
-  return (process.env.TO_EMAIL || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-}
-function requireSecret(req, res, next) {
-  const required = process.env.SHARED_SECRET;
-  if (!required) return next();
-  const token = req.get("X-Auth-Token") || req.get("x-auth-token");
-  if (token !== required) return res.status(401).json({ error: "Unauthorized" });
-  next();
-}
-
-/* ---------- Validation (more forgiving) ---------- */
+/* ---------- Validation (forgiving) ---------- */
 const Item = z.object({
   company: z.string(),
   sector: z.string().optional(),
   issue_size_cr: z.coerce.number().optional(), // "1,200" -> 1200
-  status: z.string(),                           // rumor | DRHP | RHP | approved
+  status: z.string(),
   expected_window: z.string().optional(),
-  // allow "a,b" or ["a","b"]
   lead_banks: z.preprocess(
     v => Array.isArray(v) ? v :
          (typeof v === "string" ? v.split(/[,;|]/).map(s => s.trim()).filter(Boolean) : []),
     z.array(z.string()).optional()
   ),
-  // allow url | "" | "NA"
   links: z.object({
     drhp: z.union([z.string().url(), z.literal(""), z.literal("NA")]).optional(),
     rhp: z.union([z.string().url(), z.literal(""), z.literal("NA")]).optional(),
@@ -57,7 +41,7 @@ const Payload = z.object({
   items: z.array(Item)
 });
 
-/* ---------- HTML email renderer ---------- */
+/* ---------- Helpers ---------- */
 function buildHtml(p) {
   const rows = p.items.map((it, idx) => `
     <tr>
@@ -98,7 +82,6 @@ function buildHtml(p) {
   </div>`;
 }
 
-/* ---------- Auth helper ---------- */
 function requireSecret(req, res, next) {
   const required = process.env.SHARED_SECRET;
   if (!required) return next();
@@ -106,18 +89,17 @@ function requireSecret(req, res, next) {
   if (token !== required) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
-
 function getRecipients() {
   return (process.env.TO_EMAIL || "").split(",").map(s => s.trim()).filter(Boolean);
 }
 
-/* ---------- Health (open) & Status (protected) ---------- */
+/* ---------- Routes ---------- */
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/status", requireSecret, (_req, res) => {
   res.json({
     dry_run: process.env.DRY_RUN === "1",
-    has_resend_key: !!process.env.RESEND_API_KEY,
+    has_sendgrid_key: !!process.env.SENDGRID_API_KEY,
     has_from: !!process.env.FROM_EMAIL,
     to_count: getRecipients().length,
     zapier_enabled: !!process.env.ZAPIER_HOOK_URL,
@@ -125,42 +107,6 @@ app.get("/status", requireSecret, (_req, res) => {
   });
 });
 
-/* ---------- Email providers ---------- */
-// Choose ONE provider path; here I show Resend (simple). If using SendGrid instead, see commented block below.
-// const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-
-// async function sendEmail(subject, html) {
-//   const to = getRecipients();
-//   if (!to.length) throw new Error("NO_RECIPIENTS");
-//   if (process.env.DRY_RUN === "1") {
-//     console.log("[dry-run] would send to:", to.join(", "));
-//     return;
-//   }
-
-//   if (resend && process.env.FROM_EMAIL) {
-//     const resp = await resend.emails.send({
-//       from: process.env.FROM_EMAIL, // must be verified sender/domain in Resend
-//       to,
-//       subject,
-//       html
-//     });
-//     console.log("[resend] queued:", JSON.stringify(resp));
-//     return;
-//   }
-
-  // --- SendGrid alternative ---
-import sgMail from "@sendgrid/mail" 
-if (process.env.SENDGRID_API_KEY) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-if (process.env.SENDGRID_API_KEY && process.env.FROM_EMAIL) {
-    await sgMail.send({ to, from: process.env.FROM_EMAIL, subject, html });
-    console.log("[sendgrid] queued to:", to.join(", "));
-    return;
-  }
-
-throw new Error("NO_DELIVERY_PATH_CONFIGURED");
-
-
-/* ---------- Main endpoint (protected) ---------- */
 app.post("/monthly", requireSecret, async (req, res) => {
   const parsed = Payload.safeParse(req.body);
   if (!parsed.success) {
@@ -206,12 +152,7 @@ app.post("/monthly", requireSecret, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     const sgBody = err?.response?.body ? JSON.stringify(err.response.body) : null;
-    console.error("Delivery error:", {
-      name: err?.name,
-      message: err?.message,
-      stack: err?.stack,
-      sgBody
-    });
+    console.error("Delivery error:", { name: err?.name, message: err?.message, sgBody });
     return res.status(500).json({ error: err?.message || "delivery_failed" });
   }
 });
