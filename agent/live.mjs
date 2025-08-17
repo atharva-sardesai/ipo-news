@@ -1,125 +1,152 @@
 import OpenAI from "openai";
 
-// ---------- ENV ----------
-const WEBHOOK_URL   = process.env.WEBHOOK_URL;           // e.g., https://.../monthly
+/* ------------ ENV ------------ */
+const WEBHOOK_URL   = process.env.WEBHOOK_URL;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
-const GNEWS_KEY     = process.env.GNEWS_API_KEY || "";
 const OPENAI_KEY    = process.env.OPENAI_API_KEY || "";
 const AI_MODEL      = process.env.AI_MODEL || "gpt-4o-mini";
-const MAX_ARTICLES  = Number(process.env.MAX_ARTICLES || "30");
+
+const GNEWS_KEY     = process.env.GNEWS_API_KEY || "";
+const MAX_ARTICLES  = Math.max(5, Number(process.env.MAX_ARTICLES || "20")); // modest on free tier
 const COUNTRY       = process.env.COUNTRY || "in";
 const LANG          = process.env.LANG || "en";
 
 if (!WEBHOOK_URL || !SHARED_SECRET) {
-  console.error("Missing WEBHOOK_URL or SHARED_SECRET");
-  process.exit(2);
+  console.error("Missing WEBHOOK_URL or SHARED_SECRET"); process.exit(2);
 }
 if (!OPENAI_KEY) {
-  console.error("Missing OPENAI_API_KEY");
-  process.exit(2);
+  console.error("Missing OPENAI_API_KEY"); process.exit(2);
+}
+if (!GNEWS_KEY) {
+  console.error("Missing GNEWS_API_KEY"); process.exit(2);
 }
 
-const PROVIDER = (process.env.BING_NEWS_KEY ? "bing" :
-                 (process.env.GNEWS_API_KEY ? "gnews" : "none"));
-if (PROVIDER === "none") throw new Error("Set BING_NEWS_KEY or GNEWS_API_KEY");
+const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-
-// ---------- Helpers ----------
+/* ------------ Helpers ------------ */
 function todayIST() {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
+  return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit"
-  });
-  return fmt.format(new Date()); // YYYY-MM-DD
+  }).format(new Date());
 }
 function uniq(arr) { return [...new Set(arr)]; }
-function normCompany(s) {
-  return (s || "").toLowerCase().replace(/limited|ltd\.?|private|pvt\.?|ipo|drhp|rhp|public issue/gi, "").replace(/\s+/g, " ").trim();
+function normCo(s="") {
+  return s.toLowerCase()
+    .replace(/limited|ltd\.?|private|pvt\.?|ipo|drhp|rhp|public issue/gi,"")
+    .replace(/\s+/g," ").trim();
 }
-function pickBetterStatus(a, b) {
-  const rank = { approved: 4, RHP: 3, DRHP: 2, rumor: 1 };
-  return (rank[a] || 0) >= (rank[b] || 0) ? a : b;
+function pickStatus(a,b){const r={approved:4,RHP:3,DRHP:2,rumor:1};return (r[a]||0)>=(r[b]||0)?a:b;}
+const IPO_RGX = /\b(ipo|drhp|rhp|public\s+issue|initial\s+public\s+offering)\b/i;
+
+/* ------------ Rate-limit & Retry (for GNews) ------------ */
+const BASE_DELAY_MS = 2500; // ~1 req / 2.5s
+async function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+async function gnewsFetch(url, { tries = 5 } = {}) {
+  for (let i=0;i<tries;i++){
+    const r = await fetch(url);
+    const text = await r.text();
+    if (r.ok) return JSON.parse(text);
+    if (r.status === 429) {
+      const wait = BASE_DELAY_MS * Math.pow(1.8, i) + Math.floor(Math.random()*400);
+      console.log(`[gnews] 429; backing off ${wait}ms`);
+      await sleep(wait);
+      continue;
+    }
+    if (r.status >= 500) {
+      const wait = 1000 * (i+1);
+      console.log(`[gnews] ${r.status}; retrying in ${wait}ms`);
+      await sleep(wait);
+      continue;
+    }
+    throw new Error(`GNews ${r.status}: ${text}`);
+  }
+  throw new Error("GNews retries exhausted");
 }
 
-// ---------- Fetch news from either provider ----------
-
-async function fetchGNewsSimple(query, page = 1, perPage = 10) {
-  const url = new URL("https://gnews.io/api/v4/search");
-  url.searchParams.set("q", query);          // keep it simple, no site:/OR
-  url.searchParams.set("lang", LANG);
-  url.searchParams.set("country", COUNTRY);
-  url.searchParams.set("max", String(perPage));  // free tier: <= 10
-  url.searchParams.set("page", String(page));    // pagination
-  url.searchParams.set("token", GNEWS_KEY);
-
-  const r = await fetch(url);
-  const text = await r.text();
-  if (!r.ok) throw new Error(`GNews ${r.status}: ${text}`);
-  const j = JSON.parse(text);
-
-  return (j.articles || []).map(a => ({
-    title: a.title,
-    description: a.description,
-    url: a.url,
-    source: a.source?.name,
-    publishedAt: a.publishedAt
+/* ------------ Low-request strategies ------------ */
+// A) Top headlines (few calls) then filter by IPO terms
+async function fetchTopHeadlines(p=1, per=10){
+  const u = new URL("https://gnews.io/api/v4/top-headlines");
+  u.searchParams.set("topic","business");
+  u.searchParams.set("lang",LANG);
+  u.searchParams.set("country",COUNTRY);
+  u.searchParams.set("max", String(Math.min(per,10)));
+  u.searchParams.set("page", String(p));
+  u.searchParams.set("token", GNEWS_KEY);
+  const j = await gnewsFetch(u);
+  return (j.articles||[]).map(a=>({
+    title:a.title, description:a.description, url:a.url,
+    source:a.source?.name, publishedAt:a.publishedAt
   }));
 }
 
-
+// B) One or two simple searches (no site:/OR) to top up results
+async function fetchSearch(q, p=1, per=10){
+  const u = new URL("https://gnews.io/api/v4/search");
+  u.searchParams.set("q", q);
+  u.searchParams.set("lang", LANG);
+  u.searchParams.set("country", COUNTRY);
+  u.searchParams.set("max", String(Math.min(per,10)));
+  u.searchParams.set("page", String(p));
+  u.searchParams.set("token", GNEWS_KEY);
+  const j = await gnewsFetch(u);
+  return (j.articles||[]).map(a=>({
+    title:a.title, description:a.description, url:a.url,
+    source:a.source?.name, publishedAt:a.publishedAt
+  }));
+}
 
 async function getArticles() {
-  const queriesBing = [
-    'IPO India DRHP RHP',
-    'SEBI DRHP',
-    'NSE India RHP "Public Issue"',
-    'BSE "Public Issue" RHP'
-  ];
-
-  const queriesGNews = [
-    'India IPO DRHP',
-    'India IPO RHP',
-    'SEBI IPO filing',
-    'NSE corporate announcement IPO',
-    'BSE corporate announcement IPO'
-  ];
-
   let all = [];
 
-  if (PROVIDER === "bing") {
-    for (const q of queriesBing) {
-      const chunk = await fetchBingNews(q);
-      all = all.concat(chunk);
-      await new Promise(r => setTimeout(r, 200));
-    }
-  } else { // gnews
-    const perPage = Math.min(10, MAX_ARTICLES);  // free tier limit
-    const pages = Math.max(1, Math.ceil(MAX_ARTICLES / perPage));
-    for (const q of queriesGNews) {
-      for (let p = 1; p <= pages; p++) {
-        const chunk = await fetchGNewsSimple(q, p, perPage);
+  // 1) Top headlines 2–3 pages
+  const per = Math.min(10, MAX_ARTICLES);
+  const pages = Math.min(3, Math.ceil(MAX_ARTICLES / per));
+  for (let p=1; p<=pages; p++){
+    const chunk = await fetchTopHeadlines(p, per);
+    all = all.concat(chunk);
+    await sleep(BASE_DELAY_MS);
+  }
+
+  // Filter for IPO keywords
+  all = all.filter(a => IPO_RGX.test(`${a.title} ${a.description||""}`));
+
+  // 2) If not enough, top-up with 1–2 searches
+  if (all.length < MAX_ARTICLES) {
+    const needed = MAX_ARTICLES - all.length;
+    const pagesNeeded = Math.min(2, Math.ceil(needed / per));
+    const queries = ["India IPO", "DRHP India"];
+    for (const q of queries) {
+      for (let p=1; p<=pagesNeeded; p++){
+        const chunk = await fetchSearch(q, p, per);
         all = all.concat(chunk);
-        await new Promise(r => setTimeout(r, 150));
+        await sleep(BASE_DELAY_MS);
       }
     }
   }
 
-  // dedupe by URL
+  // Dedupe by URL
   const seen = new Set();
-  return all.filter(a => !seen.has(a.url) && seen.add(a.url));
+  all = all.filter(a => !seen.has(a.url) && seen.add(a.url));
+
+  return all.slice(0, MAX_ARTICLES);
 }
 
-
-// ---------- AI extraction per article ----------
-const openai = new OpenAI({ apiKey: OPENAI_KEY });
-
+/* ------------ AI extraction & summary ------------ */
 async function extractItemFromArticle(a) {
-  // Constrain to JSON object output
-  const sys = `You convert a single article into one IPO record for India.
-Return a JSON object with keys: company (string), sector (string|optional),
-issue_size_cr (number|optional), status (one of: rumor, DRHP, RHP, approved),
-expected_window (string|optional), lead_banks (array of strings|optional),
-links (object with optional keys: drhp, rhp, exchange_notice, news), notes (string|optional).
-If a field is unknown, omit it. Use only info implied by the article text/title.`;
+  const sys = `You convert one article into ONE India IPO record.
+Return JSON object with keys:
+- company (string, required)
+- sector (string, optional)
+- issue_size_cr (number, optional)
+- status ("rumor"|"DRHP"|"RHP"|"approved", required)
+- expected_window (string, optional)
+- lead_banks (array<string>, optional)
+- links (object: drhp?, rhp?, exchange_notice?, news?)
+- notes (string, optional)
+If unknown, omit the field. Use only the article's information.`;
+
   const usr = `Article:
 TITLE: ${a.title}
 DESC: ${a.description || ""}
@@ -127,35 +154,27 @@ URL: ${a.url}
 SOURCE: ${a.source || ""}
 DATE: ${a.publishedAt || ""}
 
-Produce strictly one JSON object, no extra text. Include "news" link inside links. If the article only hints at early talks, status=rumor. If mentions DRHP filed, status=DRHP. If RHP filed, status=RHP. If regulator approval granted, status=approved.`;
+Return strictly one JSON object. Include "news" inside links.`;
 
-  const resp = await openai.chat.completions.create({
-    model: AI_MODEL,
-    temperature: 0.2,
+  const r = await openai.chat.completions.create({
+    model: AI_MODEL, temperature: 0.2,
     response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: usr }
-    ]
+    messages: [{ role:"system", content:sys }, { role:"user", content:usr }]
   });
 
-  const text = resp.choices?.[0]?.message?.content || "{}";
   let obj;
-  try { obj = JSON.parse(text); } catch { obj = {}; }
-  if (!obj || !obj.company || !obj.status) return null;
+  try { obj = JSON.parse(r.choices?.[0]?.message?.content || "{}"); }
+  catch { obj = {}; }
+  if (!obj.company || !obj.status) return null;
 
-  // Normalize/cleanup
-  if (obj.links) obj.links.news = obj.links.news || a.url;
-  else obj.links = { news: a.url };
+  obj.links = { ...(obj.links||{}), news: obj.links?.news || a.url };
   if (typeof obj.issue_size_cr === "string") {
-    const n = Number(obj.issue_size_cr.replace(/[^\d.]/g, ""));
-    if (Number.isFinite(n)) obj.issue_size_cr = n;
-    else delete obj.issue_size_cr;
+    const n = Number(obj.issue_size_cr.replace(/[^\d.]/g,""));
+    if (Number.isFinite(n)) obj.issue_size_cr = n; else delete obj.issue_size_cr;
   }
   return obj;
 }
 
-// Optional: add a short advisor-style bullet summary using the same AI
 async function addAdvisorSummary(it) {
   const facts = [
     `Company: ${it.company}`,
@@ -163,84 +182,78 @@ async function addAdvisorSummary(it) {
     Number.isFinite(it.issue_size_cr) ? `Issue size (₹ Cr): ${it.issue_size_cr}` : null,
     `Status: ${it.status}`,
     it.expected_window ? `Expected window: ${it.expected_window}` : null,
-    it.lead_banks?.length ? `Lead banks: ${it.lead_banks.join(", ")}` : null,
-    it.links?.drhp ? `DRHP: ${it.links.drhp}` : null,
-    it.links?.rhp ? `RHP: ${it.links.rhp}` : null,
+    it.lead_banks?.length ? `Lead banks: ${it.lead_banks.join(", ")}` : null
   ].filter(Boolean).join("\n");
 
-  const resp = await openai.chat.completions.create({
-    model: AI_MODEL,
-    temperature: 0.3,
+  const r = await openai.chat.completions.create({
+    model: AI_MODEL, temperature: 0.3,
     messages: [
-      { role: "system", content:
-        "You are a measured sell-side analyst. Write 3–5 crisp bullets (≤90 words total) using ONLY the provided facts. No advice, no invented numbers." },
-      { role: "user", content: `Facts:\n${facts}\n\nWrite the bullets:` }
+      { role:"system", content:"You are a measured sell-side analyst. 3–5 crisp bullets (≤90 words). Only use provided facts. No advice or invented numbers." },
+      { role:"user", content:`Facts:\n${facts}\n\nWrite the bullets:` }
     ]
   });
-  it.ai_summary = resp.choices?.[0]?.message?.content?.trim();
+  it.ai_summary = r.choices?.[0]?.message?.content?.trim();
 }
 
-// ---------- Main run ----------
+/* ------------ Main ------------ */
 (async () => {
-  console.log("Fetching news…");
-  const articles = await getArticles();
-  console.log("Articles:", articles.length);
+  try {
+    console.log("Fetching news…");
+    const articles = await getArticles();
+    console.log("Articles after filter/dedupe:", articles.length);
 
-  // Extract candidate items
-  const items = [];
-  for (const a of articles.slice(0, MAX_ARTICLES)) {
-    try {
-      const it = await extractItemFromArticle(a);
-      if (it) items.push(it);
-      await new Promise(r => setTimeout(r, 150)); // rate-friendly
-    } catch (e) {
-      console.error("extract failed:", e.message);
+    const items = [];
+    for (const a of articles) {
+      try {
+        const it = await extractItemFromArticle(a);
+        if (it) items.push(it);
+        await sleep(200); // gentle on OpenAI
+      } catch (e) {
+        console.error("extract failed:", e.message);
+      }
     }
-  }
 
-  // Dedupe by company, choose best status, merge fields
-  const byCo = new Map();
-  for (const it of items) {
-    const key = normCompany(it.company);
-    const prev = byCo.get(key);
-    if (!prev) { byCo.set(key, it); continue; }
-    // Pick stronger status
-    const betterStatus = pickBetterStatus(it.status, prev.status);
-    const merged = {
-      ...prev,
-      ...it,
-      status: betterStatus,
-      lead_banks: uniq([...(prev.lead_banks || []), ...(it.lead_banks || [])]),
-      links: { ...(prev.links || {}), ...(it.links || {}) }
+    // Merge by company; prefer stronger status; merge arrays/links
+    const byCo = new Map();
+    for (const it of items) {
+      const key = normCo(it.company);
+      const prev = byCo.get(key);
+      if (!prev) { byCo.set(key, it); continue; }
+      const merged = {
+        ...prev, ...it,
+        status: pickStatus(it.status, prev.status),
+        lead_banks: uniq([...(prev.lead_banks||[]), ...(it.lead_banks||[])]),
+        links: { ...(prev.links||{}), ...(it.links||{}) }
+      };
+      byCo.set(key, merged);
+    }
+
+    const finalItems = Array.from(byCo.values());
+    for (const it of finalItems) {
+      try { await addAdvisorSummary(it); } catch (e) { console.error("summary failed:", e.message); }
+    }
+
+    const payload = {
+      as_of_date: todayIST(),
+      timezone: "Asia/Kolkata",
+      source_notes: ["GNews (business/top-headlines + search)", "AI extraction/summary"],
+      changes_since_last_run: "Automated weekly run",
+      items: finalItems
     };
-    byCo.set(key, merged);
-  }
 
-  // Add advisor summary per company
-  const finalItems = Array.from(byCo.values());
-  for (const it of finalItems) {
-    try { await addAdvisorSummary(it); } catch (e) { console.error("summary failed:", e.message); }
-  }
-
-  // Build payload and POST to your webhook
-  const payload = {
-    as_of_date: todayIST(),
-    timezone: "Asia/Kolkata",
-    source_notes: ["Bing/GNews + AI extraction"],  // edit as you like
-    changes_since_last_run: "Automated weekly run",
-    items: finalItems
-  };
-
-  const r = await fetch(WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Auth-Token": SHARED_SECRET },
-    body: JSON.stringify(payload)
-  });
-
-  if (!r.ok) {
-    const txt = await r.text();
-    console.error("Webhook POST failed:", r.status, txt);
+    const resp = await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type":"application/json", "X-Auth-Token": SHARED_SECRET },
+      body: JSON.stringify(payload)
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      console.error("Webhook POST failed:", resp.status, t);
+      process.exit(1);
+    }
+    console.log("Sent", finalItems.length, "items to webhook OK");
+  } catch (e) {
+    console.error("Agent error:", e.message);
     process.exit(1);
   }
-  console.log("Sent", finalItems.length, "items to webhook OK");
 })();

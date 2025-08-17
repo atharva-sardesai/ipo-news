@@ -9,6 +9,9 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ipo-weekly
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 
@@ -20,28 +23,20 @@ jobs:
         working-directory: agent
         run: npm ci || npm i
 
-      - name: Debug provider selection (no secrets printed)
-        env:
-          BING_NEWS_KEY: ${{ secrets.BING_NEWS_KEY }}
-          GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
-        run: |
-          if [ -n "$BING_NEWS_KEY" ]; then echo "provider=bing";
-          elif [ -n "$GNEWS_API_KEY" ]; then echo "provider=gnews";
-          else echo "provider=none"; fi
-
       - name: Run live agent
         working-directory: agent
         env:
           WEBHOOK_URL:   ${{ secrets.WEBHOOK_URL }}
           SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
+
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: gpt-4o-mini
 
           # Use GNews (leave Bing unset)
           GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
 
-          # Optional tuning
-          MAX_ARTICLES: "30"
+          # Keep calls modest to avoid 429
+          MAX_ARTICLES: "20"
           COUNTRY: "in"
           LANG: "en"
         run: npm start
