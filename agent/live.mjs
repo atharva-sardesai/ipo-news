@@ -11,15 +11,9 @@ const MAX_ARTICLES  = Math.max(5, Number(process.env.MAX_ARTICLES || "20")); // 
 const COUNTRY       = process.env.COUNTRY || "in";
 const LANG          = process.env.LANG || "en";
 
-if (!WEBHOOK_URL || !SHARED_SECRET) {
-  console.error("Missing WEBHOOK_URL or SHARED_SECRET"); process.exit(2);
-}
-if (!OPENAI_KEY) {
-  console.error("Missing OPENAI_API_KEY"); process.exit(2);
-}
-if (!GNEWS_KEY) {
-  console.error("Missing GNEWS_API_KEY"); process.exit(2);
-}
+if (!WEBHOOK_URL || !SHARED_SECRET) { console.error("Missing WEBHOOK_URL or SHARED_SECRET"); process.exit(2); }
+if (!OPENAI_KEY) { console.error("Missing OPENAI_API_KEY"); process.exit(2); }
+if (!GNEWS_KEY) { console.error("Missing GNEWS_API_KEY"); process.exit(2); }
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
@@ -37,35 +31,23 @@ function normCo(s="") {
 }
 function pickStatus(a,b){const r={approved:4,RHP:3,DRHP:2,rumor:1};return (r[a]||0)>=(r[b]||0)?a:b;}
 const IPO_RGX = /\b(ipo|drhp|rhp|public\s+issue|initial\s+public\s+offering)\b/i;
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function isUrl(s){ try{ const u=new URL(s); return /^https?:/i.test(u.protocol); } catch { return false; } }
 
-/* ------------ Rate-limit & Retry (for GNews) ------------ */
-const BASE_DELAY_MS = 2500; // ~1 req / 2.5s
-async function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
+/* ------------ GNews with backoff ------------ */
+const BASE_DELAY_MS = 2500;
 async function gnewsFetch(url, { tries = 5 } = {}) {
   for (let i=0;i<tries;i++){
     const r = await fetch(url);
     const text = await r.text();
     if (r.ok) return JSON.parse(text);
-    if (r.status === 429) {
-      const wait = BASE_DELAY_MS * Math.pow(1.8, i) + Math.floor(Math.random()*400);
-      console.log(`[gnews] 429; backing off ${wait}ms`);
-      await sleep(wait);
-      continue;
-    }
-    if (r.status >= 500) {
-      const wait = 1000 * (i+1);
-      console.log(`[gnews] ${r.status}; retrying in ${wait}ms`);
-      await sleep(wait);
-      continue;
-    }
+    if (r.status === 429) { const w = BASE_DELAY_MS * Math.pow(1.8, i) + Math.floor(Math.random()*400); console.log(`[gnews] 429; backoff ${w}ms`); await sleep(w); continue; }
+    if (r.status >= 500) { const w = 1000 * (i+1); console.log(`[gnews] ${r.status}; retry ${w}ms`); await sleep(w); continue; }
     throw new Error(`GNews ${r.status}: ${text}`);
   }
   throw new Error("GNews retries exhausted");
 }
 
-/* ------------ Low-request strategies ------------ */
-// A) Top headlines (few calls) then filter by IPO terms
 async function fetchTopHeadlines(p=1, per=10){
   const u = new URL("https://gnews.io/api/v4/top-headlines");
   u.searchParams.set("topic","business");
@@ -75,13 +57,8 @@ async function fetchTopHeadlines(p=1, per=10){
   u.searchParams.set("page", String(p));
   u.searchParams.set("token", GNEWS_KEY);
   const j = await gnewsFetch(u);
-  return (j.articles||[]).map(a=>({
-    title:a.title, description:a.description, url:a.url,
-    source:a.source?.name, publishedAt:a.publishedAt
-  }));
+  return (j.articles||[]).map(a=>({ title:a.title, description:a.description, url:a.url, source:a.source?.name, publishedAt:a.publishedAt }));
 }
-
-// B) One or two simple searches (no site:/OR) to top up results
 async function fetchSearch(q, p=1, per=10){
   const u = new URL("https://gnews.io/api/v4/search");
   u.searchParams.set("q", q);
@@ -91,45 +68,25 @@ async function fetchSearch(q, p=1, per=10){
   u.searchParams.set("page", String(p));
   u.searchParams.set("token", GNEWS_KEY);
   const j = await gnewsFetch(u);
-  return (j.articles||[]).map(a=>({
-    title:a.title, description:a.description, url:a.url,
-    source:a.source?.name, publishedAt:a.publishedAt
-  }));
+  return (j.articles||[]).map(a=>({ title:a.title, description:a.description, url:a.url, source:a.source?.name, publishedAt:a.publishedAt }));
 }
 
 async function getArticles() {
   let all = [];
-
-  // 1) Top headlines 2–3 pages
   const per = Math.min(10, MAX_ARTICLES);
   const pages = Math.min(3, Math.ceil(MAX_ARTICLES / per));
-  for (let p=1; p<=pages; p++){
-    const chunk = await fetchTopHeadlines(p, per);
-    all = all.concat(chunk);
-    await sleep(BASE_DELAY_MS);
-  }
-
-  // Filter for IPO keywords
+  for (let p=1; p<=pages; p++){ all = all.concat(await fetchTopHeadlines(p, per)); await sleep(BASE_DELAY_MS); }
   all = all.filter(a => IPO_RGX.test(`${a.title} ${a.description||""}`));
-
-  // 2) If not enough, top-up with 1–2 searches
   if (all.length < MAX_ARTICLES) {
     const needed = MAX_ARTICLES - all.length;
     const pagesNeeded = Math.min(2, Math.ceil(needed / per));
     const queries = ["India IPO", "DRHP India"];
     for (const q of queries) {
-      for (let p=1; p<=pagesNeeded; p++){
-        const chunk = await fetchSearch(q, p, per);
-        all = all.concat(chunk);
-        await sleep(BASE_DELAY_MS);
-      }
+      for (let p=1; p<=pagesNeeded; p++){ all = all.concat(await fetchSearch(q, p, per)); await sleep(BASE_DELAY_MS); }
     }
   }
-
-  // Dedupe by URL
   const seen = new Set();
   all = all.filter(a => !seen.has(a.url) && seen.add(a.url));
-
   return all.slice(0, MAX_ARTICLES);
 }
 
@@ -167,32 +124,64 @@ Return strictly one JSON object. Include "news" inside links.`;
   catch { obj = {}; }
   if (!obj.company || !obj.status) return null;
 
-  obj.links = { ...(obj.links||{}), news: obj.links?.news || a.url };
+  // normalize simple fields
   if (typeof obj.issue_size_cr === "string") {
     const n = Number(obj.issue_size_cr.replace(/[^\d.]/g,""));
     if (Number.isFinite(n)) obj.issue_size_cr = n; else delete obj.issue_size_cr;
   }
+  obj.links = { ...(obj.links||{}), news: obj.links?.news || a.url };
   return obj;
 }
 
-async function addAdvisorSummary(it) {
-  const facts = [
-    `Company: ${it.company}`,
-    it.sector ? `Sector: ${it.sector}` : null,
-    Number.isFinite(it.issue_size_cr) ? `Issue size (₹ Cr): ${it.issue_size_cr}` : null,
-    `Status: ${it.status}`,
-    it.expected_window ? `Expected window: ${it.expected_window}` : null,
-    it.lead_banks?.length ? `Lead banks: ${it.lead_banks.join(", ")}` : null
-  ].filter(Boolean).join("\n");
+/* ------------ FINAL SANITIZER (matches your server Zod) ------------ */
+function cleanLinks(links) {
+  const src = links && typeof links === "object" ? links : {};
+  const out = {};
+  for (const k of ["drhp","rhp","exchange_notice","news"]) {
+    const v = src[k];
+    if (typeof v !== "string") continue;
+    const s = v.trim();
+    if (s === "" || s.toUpperCase() === "NA") { out[k] = s; continue; }
+    if (isUrl(s)) out[k] = s;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+function sanitizeItem(it) {
+  if (!it || typeof it !== "object") return null;
+  const company = String(it.company || "").trim();
+  const status0 = String(it.status || "").trim();
+  if (!company || !status0) return null;
 
-  const r = await openai.chat.completions.create({
-    model: AI_MODEL, temperature: 0.3,
-    messages: [
-      { role:"system", content:"You are a measured sell-side analyst. 3–5 crisp bullets (≤90 words). Only use provided facts. No advice or invented numbers." },
-      { role:"user", content:`Facts:\n${facts}\n\nWrite the bullets:` }
-    ]
-  });
-  it.ai_summary = r.choices?.[0]?.message?.content?.trim();
+  // normalize status to preferred labels (server accepts any string, this keeps it tidy)
+  const sL = status0.toLowerCase();
+  let status = status0;
+  if (sL.includes("approved") || sL.includes("nod")) status = "approved";
+  else if (sL.includes("rhp")) status = "RHP";
+  else if (sL.includes("drhp") || sL.includes("draft red herring")) status = "DRHP";
+  else if (sL.includes("rumor") || sL.includes("considering") || sL.includes("mulls") || sL.includes("plan")) status = "rumor";
+
+  const out = { company, status };
+
+  if (it.sector) out.sector = String(it.sector).trim();
+  if (it.expected_window) out.expected_window = String(it.expected_window).trim();
+
+  if (it.issue_size_cr != null) {
+    const n = Number(String(it.issue_size_cr).replace(/[^\d.]/g,""));
+    if (Number.isFinite(n)) out.issue_size_cr = n;
+  }
+
+  let banks = it.lead_banks;
+  if (Array.isArray(banks)) { banks = banks.map(x => String(x).trim()).filter(Boolean); }
+  else if (typeof banks === "string") { banks = banks.split(/[,;|]/).map(s=>s.trim()).filter(Boolean); }
+  else { banks = []; }
+  if (banks.length) out.lead_banks = banks;
+
+  const links = cleanLinks(it.links);
+  if (links) out.links = links;
+
+  if (it.notes) out.notes = String(it.notes).trim();
+
+  return out;
 }
 
 /* ------------ Main ------------ */
@@ -228,17 +217,18 @@ async function addAdvisorSummary(it) {
       byCo.set(key, merged);
     }
 
-    const finalItems = Array.from(byCo.values());
-    for (const it of finalItems) {
-      try { await addAdvisorSummary(it); } catch (e) { console.error("summary failed:", e.message); }
-    }
+    // Final sanitize to satisfy server Zod
+    const finalItemsRaw = Array.from(byCo.values());
+    const sanitized = finalItemsRaw.map(sanitizeItem).filter(Boolean);
+    const dropped = finalItemsRaw.length - sanitized.length;
+    if (dropped > 0) console.log(`[validate] dropped ${dropped} invalid item(s)`);
 
     const payload = {
       as_of_date: todayIST(),
       timezone: "Asia/Kolkata",
       source_notes: ["GNews (business/top-headlines + search)", "AI extraction/summary"],
       changes_since_last_run: "Automated weekly run",
-      items: finalItems
+      items: sanitized
     };
 
     const resp = await fetch(WEBHOOK_URL, {
@@ -251,7 +241,7 @@ async function addAdvisorSummary(it) {
       console.error("Webhook POST failed:", resp.status, t);
       process.exit(1);
     }
-    console.log("Sent", finalItems.length, "items to webhook OK");
+    console.log("Sent", sanitized.length, "items to webhook OK");
   } catch (e) {
     console.error("Agent error:", e.message);
     process.exit(1);
